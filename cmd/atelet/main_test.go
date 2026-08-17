@@ -1253,11 +1253,17 @@ type recordingObjectStorage struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	putErr  error
+	// getErr stands in for a storage backend that is unreachable rather than
+	// empty — an error a caller must not read as "the object is not there".
+	getErr error
 }
 
 func (r *recordingObjectStorage) GetObject(_ context.Context, bucket, object string) (io.ReadCloser, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.getErr != nil {
+		return nil, r.getErr
+	}
 	b, ok := r.objects[bucket+"/"+object]
 	if !ok {
 		return nil, fmt.Errorf("%w: Bucket:%q, Object:%q", ateerrors.ReasonFailedGetExternalObject, bucket, object)
@@ -1578,5 +1584,256 @@ func TestValidateUploadPausedCheckpointRequest(t *testing.T) {
 				t.Errorf("validateUploadPausedCheckpointRequest err = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// useTempActorsDir points the shared actor-state root at a temp directory, so
+// tests touching an actor's on-node paths (local snapshots, checkpoint state)
+// stay off the node's real /var/lib tree.
+func useTempActorsDir(t *testing.T) {
+	t.Helper()
+	orig := ateompath.ActorsDir
+	t.Cleanup(func() { ateompath.ActorsDir = orig })
+	ateompath.ActorsDir = t.TempDir()
+}
+
+func TestCheckpointAlreadyCommitted(t *testing.T) {
+	ctx := context.Background()
+	const manifestKey = "bucket/root/snapshots/ate-demo/counter-1-snap/manifest.json"
+
+	t.Run("external with an uploaded manifest", func(t *testing.T) {
+		s := &AteomHerder{gcsClient: &recordingObjectStorage{
+			objects: map[string][]byte{manifestKey: []byte(`{"pauseImage":"pause:v1"}`)},
+		}}
+
+		got, err := s.checkpointAlreadyCommitted(ctx, validCheckpointRequest())
+		if err != nil {
+			t.Fatalf("checkpointAlreadyCommitted: %v", err)
+		}
+		if !got {
+			t.Error("committed = false, want true: the manifest is the commit marker")
+		}
+	})
+
+	t.Run("external with no manifest", func(t *testing.T) {
+		s := &AteomHerder{gcsClient: &recordingObjectStorage{}}
+
+		got, err := s.checkpointAlreadyCommitted(ctx, validCheckpointRequest())
+		if err != nil {
+			t.Fatalf("checkpointAlreadyCommitted: %v", err)
+		}
+		if got {
+			t.Error("committed = true, want false")
+		}
+	})
+
+	t.Run("external probe failure is not read as uncommitted", func(t *testing.T) {
+		// Reading an unreachable bucket as "not committed" would send a
+		// destructive checkpoint down the re-run path on the strength of a
+		// failed lookup.
+		s := &AteomHerder{gcsClient: &recordingObjectStorage{getErr: errors.New("bucket unreachable")}}
+
+		if _, err := s.checkpointAlreadyCommitted(ctx, validCheckpointRequest()); err == nil {
+			t.Fatal("checkpointAlreadyCommitted succeeded, want the probe error surfaced")
+		}
+	})
+
+	t.Run("local with a written manifest", func(t *testing.T) {
+		useTempActorsDir(t)
+		req := validCheckpointRequest()
+		req.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
+		req.Config = &ateletpb.CheckpointRequest_LocalConfig{
+			LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "pause-snap-1"},
+		}
+		writeLocalSnapshot(t, ateompath.LocalSnapshotDir(req.GetActorUid(), "pause-snap-1"),
+			sandboxAssetsRecord{SandboxClass: "gvisor", PauseImage: testPauseImage, SnapshotFiles: []string{"checkpoint.img"}},
+			map[string]string{"checkpoint.img": "img"})
+
+		got, err := (&AteomHerder{}).checkpointAlreadyCommitted(ctx, req)
+		if err != nil {
+			t.Fatalf("checkpointAlreadyCommitted: %v", err)
+		}
+		if !got {
+			t.Error("committed = false, want true")
+		}
+	})
+
+	t.Run("local with no snapshot dir", func(t *testing.T) {
+		useTempActorsDir(t)
+		req := validCheckpointRequest()
+		req.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
+		req.Config = &ateletpb.CheckpointRequest_LocalConfig{
+			LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "pause-snap-1"},
+		}
+
+		got, err := (&AteomHerder{}).checkpointAlreadyCommitted(ctx, req)
+		if err != nil {
+			t.Fatalf("checkpointAlreadyCommitted: %v", err)
+		}
+		if got {
+			t.Error("committed = true, want false")
+		}
+	})
+}
+
+func TestCheckpointFastForwardsWhenAlreadyCommitted(t *testing.T) {
+	// No sandbox record on disk and no ateom dialer: every step after the
+	// commit probe would fail, so a success here can only come from the
+	// fast-forward.
+	useTempActorsDir(t)
+	s := &AteomHerder{gcsClient: &recordingObjectStorage{
+		objects: map[string][]byte{
+			"bucket/root/snapshots/ate-demo/counter-1-snap/manifest.json": []byte(`{"pauseImage":"pause:v1"}`),
+		},
+	}}
+
+	// The state an attempt that committed its snapshot and then died leaves
+	// behind: the actor's on-node dirs still populated, because the teardown
+	// after the commit never ran.
+	req := validCheckpointRequest()
+	bundleDir := ateompath.OCIBundleDir(req.GetActorUid())
+	if err := os.MkdirAll(bundleDir, 0o700); err != nil {
+		t.Fatalf("creating bundle dir: %v", err)
+	}
+	leftover := filepath.Join(bundleDir, "leftover")
+	if err := os.WriteFile(leftover, []byte("x"), 0o600); err != nil {
+		t.Fatalf("writing leftover: %v", err)
+	}
+
+	resp, err := s.Checkpoint(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Checkpoint: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("Checkpoint returned a nil response")
+	}
+
+	// Fast-forwarding past the teardown would hand the workflow an actor whose
+	// volumes are still mounted and whose dirs still hold the last activation.
+	if _, err := os.Stat(leftover); !os.IsNotExist(err) {
+		t.Errorf("bundle dir still populated (err=%v), want the checkpoint teardown to have reset it", err)
+	}
+}
+
+// The prune that clears superseded snapshots must not take the destination of
+// the checkpoint being written: an attempt that moved part of the snapshot
+// there and died left the only copy of those files in that directory. This
+// runs the two in the order Checkpoint runs them, which is the only order in
+// which the bug appears — moveLocalCheckpoint alone resumes fine.
+func TestCheckpointPruneKeepsPartiallyMovedSnapshot(t *testing.T) {
+	ctx := context.Background()
+	useTempActorsDir(t)
+
+	req := validCheckpointRequest()
+	req.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
+	req.Config = &ateletpb.CheckpointRequest_LocalConfig{
+		LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "pause-snap-2"},
+	}
+	rec := &sandboxAssetsRecord{
+		SandboxClass:  "gvisor",
+		PauseImage:    testPauseImage,
+		SnapshotFiles: []string{"checkpoint.img", "pages.img"},
+	}
+
+	// One file already renamed into this checkpoint's destination, the other
+	// still in the checkpoint dir, no manifest — plus a superseded snapshot
+	// from an earlier pause, which is what prune is here to collect.
+	checkpointDir := ateompath.CheckpointStateDir(req.GetActorUid())
+	dstDir := ateompath.LocalSnapshotDir(req.GetActorUid(), "pause-snap-2")
+	staleDir := ateompath.LocalSnapshotDir(req.GetActorUid(), "pause-snap-1")
+	for dir, files := range map[string]map[string]string{
+		checkpointDir: {"pages.img": "pages"},
+		dstDir:        {"checkpoint.img": "img"},
+		staleDir:      {"checkpoint.img": "old"},
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("creating %s: %v", dir, err)
+		}
+		for name, body := range files {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+				t.Fatalf("writing %s: %v", name, err)
+			}
+		}
+	}
+
+	pruneLocalCheckpoints(ctx, req.GetActorUid(), req.GetLocalConfig().GetSnapshotName())
+	if err := (&AteomHerder{}).moveLocalCheckpoint(ctx, req, checkpointDir, rec); err != nil {
+		t.Fatalf("moveLocalCheckpoint: %v", err)
+	}
+
+	for _, name := range append(rec.SnapshotFiles, sandboxManifestName) {
+		if _, err := os.Stat(filepath.Join(dstDir, name)); err != nil {
+			t.Errorf("%s missing from the snapshot dir: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(staleDir); !os.IsNotExist(err) {
+		t.Errorf("superseded snapshot still exists (err=%v), want pruned", err)
+	}
+}
+
+func TestMoveLocalCheckpointResumesPartialMove(t *testing.T) {
+	ctx := context.Background()
+	useTempActorsDir(t)
+
+	req := validCheckpointRequest()
+	req.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
+	req.Config = &ateletpb.CheckpointRequest_LocalConfig{
+		LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "pause-snap-1"},
+	}
+	rec := &sandboxAssetsRecord{
+		SandboxClass:  "gvisor",
+		PauseImage:    testPauseImage,
+		SnapshotFiles: []string{"checkpoint.img", "pages.img"},
+	}
+
+	// The state an interrupted move leaves: one file already renamed into the
+	// snapshot dir, the other still in the checkpoint dir, no manifest.
+	checkpointDir := ateompath.CheckpointStateDir(req.GetActorUid())
+	dstDir := ateompath.LocalSnapshotDir(req.GetActorUid(), "pause-snap-1")
+	for dir, files := range map[string]map[string]string{
+		checkpointDir: {"pages.img": "pages"},
+		dstDir:        {"checkpoint.img": "img"},
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("creating %s: %v", dir, err)
+		}
+		for name, body := range files {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+				t.Fatalf("writing %s: %v", name, err)
+			}
+		}
+	}
+
+	if err := (&AteomHerder{}).moveLocalCheckpoint(ctx, req, checkpointDir, rec); err != nil {
+		t.Fatalf("moveLocalCheckpoint: %v", err)
+	}
+
+	for _, name := range append(rec.SnapshotFiles, sandboxManifestName) {
+		if _, err := os.Stat(filepath.Join(dstDir, name)); err != nil {
+			t.Errorf("%s missing from the snapshot dir: %v", name, err)
+		}
+	}
+}
+
+func TestMoveLocalCheckpointFailsWhenFileGoneFromBothSides(t *testing.T) {
+	useTempActorsDir(t)
+
+	req := validCheckpointRequest()
+	req.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
+	req.Config = &ateletpb.CheckpointRequest_LocalConfig{
+		LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "pause-snap-1"},
+	}
+	checkpointDir := ateompath.CheckpointStateDir(req.GetActorUid())
+	if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
+		t.Fatalf("creating checkpoint dir: %v", err)
+	}
+
+	rec := &sandboxAssetsRecord{SandboxClass: "gvisor", PauseImage: testPauseImage, SnapshotFiles: []string{"checkpoint.img"}}
+	err := (&AteomHerder{}).moveLocalCheckpoint(context.Background(), req, checkpointDir, rec)
+	if err == nil {
+		t.Fatal("moveLocalCheckpoint succeeded, want a failure: the snapshot cannot be assembled")
+	}
+	if !errors.Is(err, ateerrors.ReasonTerminalFileSystemError) {
+		t.Errorf("err = %v, want it tagged %v", err, ateerrors.ReasonTerminalFileSystemError)
 	}
 }
