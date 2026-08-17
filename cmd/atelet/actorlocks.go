@@ -14,7 +14,12 @@
 
 package main
 
-import "sync"
+import (
+	"sync"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
 
 // actorLocks serializes node-local operations that would otherwise run against
 // one actor's on-node state concurrently.
@@ -26,6 +31,13 @@ import "sync"
 // attempt may still be uploading from. Recognizing a repeated operation and
 // excluding a concurrent one are separate problems, and solving the first does
 // not solve the second.
+//
+// Every RPC that clears an actor's on-node state takes it, not only Checkpoint:
+// UploadPausedCheckpoint prunes every local snapshot, and Run and Restore reset
+// the actor's directories. Each of those destroys what an in-flight checkpoint
+// is still reading from, and the lease expiry that lets two checkpoints overlap
+// lets a checkpoint overlap with any of them just as easily. A lock one caller
+// can walk around is not a lock.
 //
 // The zero value is ready to use. Entries are dropped on release, so this
 // holds one entry per in-flight operation rather than one per actor the node
@@ -59,4 +71,21 @@ func (l *actorLocks) tryLock(actorUID string) (release func(), ok bool) {
 			delete(l.held, actorUID)
 		})
 	}, true
+}
+
+// lockActorFor claims actorUID for the named operation, or refuses it.
+//
+// The refusal is Aborted: retriable, and carrying no crash directive, because
+// nothing is wrong with the actor — another operation simply holds it. It is
+// deliberately not a queued wait: the caller has nothing to contribute while
+// the holder moves gigabytes, and keeping the RPC open for that long only
+// risks a timeout on a call that was never doing anything. By the time the
+// control plane retries, the holder has usually finished, and a re-entered
+// checkpoint's fast-forward answers immediately.
+func (s *AteomHerder) lockActorFor(operation, actorUID string) (release func(), _ error) {
+	release, ok := s.actorLocks.tryLock(actorUID)
+	if !ok {
+		return nil, status.Errorf(codes.Aborted, "cannot start %s for actor %s: another operation on this actor is already in progress on this node", operation, actorUID)
+	}
+	return release, nil
 }

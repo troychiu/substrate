@@ -2031,3 +2031,51 @@ func TestCheckpointRejectsConcurrentAttemptForSameActor(t *testing.T) {
 		t.Error("a checkpoint for a different actor was rejected as concurrent")
 	}
 }
+
+// The lock is only worth having if every RPC that clears the actor's on-node
+// state takes it: UploadPausedCheckpoint prunes its local snapshots, and Run
+// and Restore reset its directories, each of them destroying what an in-flight
+// checkpoint is still reading from.
+func TestActorLockExcludesTheOtherNodeLocalOperations(t *testing.T) {
+	ctx := context.Background()
+	const actorUID = "123e4567-e89b-12d3-a456-426614174000"
+
+	tests := []struct {
+		name string
+		call func(*AteomHerder) error
+	}{
+		{"Run", func(s *AteomHerder) error {
+			_, err := s.Run(ctx, validRunRequest())
+			return err
+		}},
+		{"Restore", func(s *AteomHerder) error {
+			_, err := s.Restore(ctx, validRestoreRequest())
+			return err
+		}},
+		{"UploadPausedCheckpoint", func(s *AteomHerder) error {
+			_, err := s.UploadPausedCheckpoint(ctx, validUploadPausedCheckpointRequest())
+			return err
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useTempActorsDir(t)
+			s := &AteomHerder{gcsClient: &recordingObjectStorage{}}
+
+			release, ok := s.actorLocks.tryLock(actorUID)
+			if !ok {
+				t.Fatal("could not take the actor lock to stand in for an in-flight checkpoint")
+			}
+			defer release()
+
+			err := tt.call(s)
+			if status.Code(err) != codes.Aborted {
+				t.Errorf("%s code = %v (err=%v), want %v", tt.name, status.Code(err), err, codes.Aborted)
+			}
+			// The actor is fine; another operation simply holds it.
+			if ateerrors.ActorCrashRequested(err) {
+				t.Errorf("%s's concurrent-operation rejection asks the control plane to crash the actor", tt.name)
+			}
+		})
+	}
+}
