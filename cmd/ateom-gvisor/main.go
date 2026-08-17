@@ -862,8 +862,25 @@ func classifyCheckpointFailure(ctx context.Context, rcmd *runsc, err error) erro
 // cases. Failing to match is the safe direction (the checkpoint error stays
 // retriable), so the match stays on runsc's own phrasing rather than anything
 // looser that might catch an unrelated error.
+//
+// Only the `error:` line counts. We run runsc with --alsologtostderr, so the
+// captured output is runsc's whole log stream, and gVisor logs "does not
+// exist" about incidental things it probes along the way (an absent cgroup
+// path, a missing file). Matching the stream as a whole would let one of those
+// lines crash an actor whose sandbox is alive and whose checkpoint failure was
+// retriable. runsc's own verdict is the single line its fatal path writes with
+// an `error: ` prefix.
 func sandboxNotFound(runscOutput []byte) bool {
-	return strings.Contains(strings.ToLower(string(runscOutput)), "does not exist")
+	for line := range strings.Lines(string(runscOutput)) {
+		msg, ok := strings.CutPrefix(strings.TrimSpace(line), "error:")
+		if !ok {
+			continue
+		}
+		if strings.Contains(strings.ToLower(msg), "does not exist") {
+			return true
+		}
+	}
+	return false
 }
 
 // listSnapshotFiles returns the (relative) names of regular files directly under

@@ -164,6 +164,22 @@ func TestSandboxNotFound(t *testing.T) {
 		{"runsc binary missing", "fork/exec /usr/bin/runsc: no such file or directory", false},
 		{"probe timed out", "signal: killed", false},
 		{"no output at all", "", false},
+		// We capture runsc's whole --alsologtostderr stream, and gVisor logs
+		// "does not exist" about things it merely probed on its way to an
+		// unrelated failure. Only the verdict line counts: reading a log line as
+		// the verdict would crash an actor whose sandbox is alive.
+		{
+			"phrase in an incidental log line, verdict says otherwise",
+			`{"msg":"cgroup path \"/sys/fs/cgroup/runsc\" does not exist, skipping","level":"warning"}
+error: connecting to control server: connection refused`,
+			false,
+		},
+		{
+			"verdict after log noise",
+			`{"msg":"loading container","level":"info"}
+error: loading container: container "pause" does not exist`,
+			true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
