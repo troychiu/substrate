@@ -715,6 +715,17 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	}
 
 	checkpointPath := ateompath.CheckpointStateDir(req.GetActorUid())
+	// Start from a clean dir so runsc's image files are the only contents. A
+	// checkpoint that failed with the sandbox still up is retried through here,
+	// and its half-written images would otherwise survive: listSnapshotFiles
+	// reports the union of both attempts, so the manifest — and the image
+	// directory a later restore is handed — would carry pages from a checkpoint
+	// that never completed. Nothing worth keeping is here: the completed
+	// checkpoint's marker lives in this dir too, and reaching this line means
+	// the replay above did not find one.
+	if err := os.RemoveAll(checkpointPath); err != nil {
+		return nil, fmt.Errorf("while clearing checkpoint directory: %w", err)
+	}
 	if err := os.MkdirAll(checkpointPath, 0o700); err != nil {
 		return nil, fmt.Errorf("while creating checkpoint directory: %w", err)
 	}

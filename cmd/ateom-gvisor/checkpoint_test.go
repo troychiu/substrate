@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -187,5 +188,34 @@ error: loading container: container "pause" does not exist`,
 				t.Errorf("sandboxNotFound(%q) = %v, want %v", tt.out, got, tt.want)
 			}
 		})
+	}
+}
+
+// A retried checkpoint must not inherit the previous attempt's images: they
+// would join the manifest through listSnapshotFiles and reach a restore as
+// pages from a checkpoint that never completed.
+func TestCheckpointWorkloadClearsStaleCheckpointFiles(t *testing.T) {
+	const actorUID = "actor-1"
+	dir := useTempActorsDir(t, actorUID)
+
+	stale := filepath.Join(dir, "pages.img")
+	if err := os.WriteFile(stale, []byte("half-written"), 0o600); err != nil {
+		t.Fatalf("writing stale image: %v", err)
+	}
+
+	// No marker and no runsc: the checkpoint itself fails, which is fine — the
+	// dir is cleared on the way there, before anything is written.
+	s := newCheckpointTestService()
+	if _, err := s.CheckpointWorkload(context.Background(), &ateompb.CheckpointWorkloadRequest{
+		Atespace:  "ate-demo",
+		ActorName: "counter-1",
+		ActorUid:  actorUID,
+		Scope:     ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL,
+	}); err == nil {
+		t.Fatal("CheckpointWorkload succeeded, want a failure with no runsc to drive")
+	}
+
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("os.Stat(%q) = %v, want the previous attempt's image to be gone", stale, err)
 	}
 }
