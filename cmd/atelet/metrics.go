@@ -30,6 +30,7 @@ import (
 const (
 	restoreDurationMetric    = "ate.actor.restore.duration"
 	checkpointDurationMetric = "ate.actor.checkpoint.duration"
+	checkpointReplayedMetric = "ate.actor.checkpoint.replayed"
 )
 
 // snapshotPhaseBuckets have to cover both ends of a phase breakdown: a warm OCI
@@ -42,6 +43,7 @@ var snapshotPhaseBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1
 type Instruments struct {
 	restoreDuration    metric.Float64Histogram
 	checkpointDuration metric.Float64Histogram
+	checkpointReplayed metric.Int64Counter
 }
 
 func NewInstruments(meter metric.Meter) (*Instruments, error) {
@@ -65,9 +67,18 @@ func NewInstruments(meter metric.Meter) (*Instruments, error) {
 		return nil, fmt.Errorf("create %s histogram: %w", checkpointDurationMetric, err)
 	}
 
+	checkpointReplayed, err := meter.Int64Counter(
+		checkpointReplayedMetric,
+		metric.WithDescription("Checkpoints answered from a snapshot an earlier attempt had already committed, rather than re-run. Counts lost checkpoint responses, which are otherwise invisible: the recovery is silent and records no duration."),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create %s counter: %w", checkpointReplayedMetric, err)
+	}
+
 	return &Instruments{
 		restoreDuration:    restoreDuration,
 		checkpointDuration: checkpointDuration,
+		checkpointReplayed: checkpointReplayed,
 	}, nil
 }
 
@@ -121,6 +132,22 @@ func (i *Instruments) recordCheckpoint(ctx context.Context, op snapshotOp, err e
 		return
 	}
 	recordPhases(ctx, i.checkpointDuration, op, err, phases)
+}
+
+// recordCheckpointReplayed counts a checkpoint answered from a snapshot an
+// earlier attempt had already committed.
+//
+// Deliberately a counter and not a phase on the histogram above: a replay does
+// none of the work the phases measure, and timing it would report near-zero
+// durations against snapshots that take seconds to write. Without it the
+// recovery leaves no trace at all — it is the one successful Checkpoint that
+// records no duration — so a node quietly replaying every checkpoint would look
+// like a node taking none.
+func (i *Instruments) recordCheckpointReplayed(ctx context.Context, op snapshotOp) {
+	if i == nil || i.checkpointReplayed == nil {
+		return
+	}
+	i.checkpointReplayed.Add(ctx, 1, metric.WithAttributes(op.attrs()...))
 }
 
 // recordPhases skips zero-valued phases: those never started, because the

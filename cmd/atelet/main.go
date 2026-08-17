@@ -508,16 +508,57 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	actorUID := req.GetActorUid()
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
 
-	// Per-phase timing, recorded on the way out so a failed checkpoint still
-	// reports the phases it completed. Phases left at zero never ran.
-	tStart := time.Now()
-	var dAssets, dAteom, dPersist time.Duration
+	// A checkpoint whose snapshot is already at its destination is done, and
+	// re-running it would drive a sandbox the first attempt destroyed (#372).
+	// The control plane mints the destination once per suspend/pause and
+	// re-sends it on every re-entry, so a manifest there names THIS checkpoint
+	// and no other.
+	//
+	// Checked before the metrics defer below is installed: a replay that does
+	// no work is not a checkpoint, and recording it as one would report a
+	// near-zero duration against snapshots that take seconds to write.
+	// Checked before pruneLocalCheckpoints too, which would otherwise delete
+	// the local snapshot that proves the earlier success.
+	//
+	// Costs one small object read per external checkpoint. That is paid before
+	// the guest is paused, against an operation that goes on to move
+	// gigabytes.
+	// The dimensions both paths below report under. Built before the
+	// fast-forward so a replay can be counted with the same attributes a real
+	// checkpoint carries; sandboxClass joins it later, once the on-node record
+	// has been read, and attrs() omits it while it is unknown.
 	op := snapshotOp{
 		templateNamespace: req.GetActorTemplateNamespace(),
 		templateName:      req.GetActorTemplateName(),
 		kind:              checkpointSnapshotKind(req),
 		scope:             ateattr.SnapshotScopeValue(req.GetScope()),
 	}
+
+	committed, err := s.checkpointAlreadyCommitted(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if committed {
+		slog.InfoContext(ctx, "Checkpoint already committed to its destination; finishing its teardown",
+			slog.Any("actor", actorRef), slog.String("actor_uid", actorUID))
+		s.instruments.recordCheckpointReplayed(ctx, op)
+		// The snapshot is committed, but the teardown that follows it is not
+		// part of that commit: an attempt that wrote the manifest and then died
+		// left the actor's volumes still mounted and its on-node dirs still
+		// populated. Returning success over that would hand the workflow an
+		// actor whose volumes it is about to detach while they are still
+		// node-published. Both steps are idempotent, so re-running them here
+		// costs nothing when the first attempt did finish.
+		if err := s.finishCheckpoint(ctx, actorUID, req.GetSpec().GetVolumes()); err != nil {
+			return nil, err
+		}
+		return &ateletpb.CheckpointResponse{}, nil
+	}
+
+	// Per-phase timing, recorded on the way out so a failed checkpoint still
+	// reports the phases it completed. Phases left at zero never ran.
+	tStart := time.Now()
+	var dAssets, dAteom, dPersist time.Duration
 	defer func() {
 		s.instruments.recordCheckpoint(ctx, op, err,
 			phase{ateattr.SnapshotPhaseSandboxAssets, dAssets},
@@ -568,8 +609,9 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	})
 	dAteom = time.Since(tAteom)
 	if err != nil {
-		// TODO: Ateom should classify checkpoint failures, and set "should-crash"
-		// in the metadata if the error is not retriable.
+		// ateom classifies its own checkpoint failures and tags the
+		// unrecoverable ones with the crash directive; the wrap below preserves
+		// that, since status.FromError finds the ErrorInfo through it.
 		op.failedPhase = ateattr.SnapshotPhaseAteomCheckpoint
 		return nil, fmt.Errorf("while calling ateom.CheckpointWorkload: %w", err)
 	}
@@ -585,11 +627,16 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	sandboxRec.ActorTemplateName = req.GetActorTemplateName()
 	sandboxRec.Scope = ateattr.SnapshotScopeValue(req.GetScope())
 
-	// No earlier pause snapshot can ever be restored again, so remove them
-	// all: the actor's current state was just captured by CheckpointWorkload,
-	// and the control plane tracks only a single local snapshot, which this
+	// No earlier pause snapshot can ever be restored again, so remove them:
+	// the actor's current state was just captured by CheckpointWorkload, and
+	// the control plane tracks only a single local snapshot, which this
 	// checkpoint either overwrites (pause) or clears (suspend).
-	pruneLocalCheckpoints(ctx, actorUID)
+	//
+	// This checkpoint's own destination is spared. A re-entered attempt can
+	// have moved part of the snapshot there already, and those files exist
+	// nowhere else — deleting them here would leave the move below with a file
+	// missing from both sides and no way to assemble the snapshot.
+	pruneLocalCheckpoints(ctx, actorUID, req.GetLocalConfig().GetSnapshotName())
 
 	// Pruning stays outside the persist window: it collects superseded
 	// snapshots on both paths, so timing it as part of an external upload would
@@ -614,16 +661,31 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	}
 	dPersist = time.Since(tPersist)
 
-	if err := s.unmountExternalVolumes(ctx, actorUID, req.GetSpec().GetVolumes()); err != nil {
-		return nil, ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonTerminalFileSystemError, ateerrors.ActorCrashedMetadata(), fmt.Errorf("while unmounting external volumes: %w", err))
+	if err := s.finishCheckpoint(ctx, actorUID, req.GetSpec().GetVolumes()); err != nil {
+		return nil, err
+	}
+
+	return &ateletpb.CheckpointResponse{}, nil
+}
+
+// finishCheckpoint releases what the checkpointed actor still holds on this
+// node: its external volumes, and its on-node directories.
+//
+// Split out from Checkpoint because it runs on two paths — after a snapshot
+// this call persisted, and after one an earlier attempt persisted (the
+// fast-forward above). Both steps are idempotent: unmountExternalVolumes reads
+// a NotFound volume as already unmounted, and resetActorDirs is remove +
+// recreate.
+func (s *AteomHerder) finishCheckpoint(ctx context.Context, actorUID string, volumes []*ateletpb.Volume) error {
+	if err := s.unmountExternalVolumes(ctx, actorUID, volumes); err != nil {
+		return ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonTerminalFileSystemError, ateerrors.ActorCrashedMetadata(), fmt.Errorf("while unmounting external volumes: %w", err))
 	}
 
 	// Note: we do not crash the actor if resetting the directory fails.
 	if err := resetActorDirs(actorUID); err != nil {
-		return nil, fmt.Errorf("while resetting actor dirs: %w", err)
+		return fmt.Errorf("while resetting actor dirs: %w", err)
 	}
-
-	return &ateletpb.CheckpointResponse{}, nil
+	return nil
 }
 
 func toAteomSnapshotScope(scope ateletpb.SnapshotScope) ateompb.SnapshotScope {
@@ -638,6 +700,62 @@ func toAteomSnapshotScope(scope ateletpb.SnapshotScope) ateompb.SnapshotScope {
 	}
 }
 
+// checkpointAlreadyCommitted reports whether the snapshot this request asks
+// for is already written to its destination, i.e. whether an earlier attempt
+// at this same checkpoint completed and only its response went missing.
+//
+// The manifest is the commit marker on both paths, which is what makes this
+// answer trustworthy: uploadSnapshot writes it last and never in parallel with
+// the files it lists, and moveLocalCheckpoint writes it after the last rename.
+// A manifest therefore implies every file it names is already in place, while
+// an interrupted attempt leaves at most orphaned files and no manifest.
+func (s *AteomHerder) checkpointAlreadyCommitted(ctx context.Context, req *ateletpb.CheckpointRequest) (bool, error) {
+	switch req.GetType() {
+	case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
+		uri, err := resources.ParseSnapshotURI(req.GetExternalConfig().GetSnapshotUri())
+		if err != nil {
+			return false, ateerrors.CrashIfReason(ctx, err, ateerrors.ReasonInvalidObjectURL)
+		}
+		return s.snapshotManifestUploaded(ctx, uri)
+
+	case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
+		path := filepath.Join(ateompath.LocalSnapshotDir(req.GetActorUid(), req.GetLocalConfig().GetSnapshotName()), sandboxManifestName)
+		switch _, err := os.Stat(path); {
+		case err == nil:
+			return true, nil
+		case errors.Is(err, os.ErrNotExist):
+			return false, nil
+		default:
+			return false, wrapFileSystemErr("while probing for an already-written local snapshot manifest", err)
+		}
+
+	default:
+		// Unreachable: validateCheckpointRequest rejects any other type before
+		// this runs. Answering "not committed" leaves the rejection to the
+		// type switches that own it rather than inventing a second message.
+		return false, nil
+	}
+}
+
+// snapshotManifestUploaded reports whether the snapshot at uri has its
+// manifest in object storage. A missing manifest is an answer, not a failure;
+// any other error is one, and is returned rather than read as "not there" —
+// treating an unreachable bucket as "not committed" would re-run a destructive
+// checkpoint on the strength of a failed lookup.
+func (s *AteomHerder) snapshotManifestUploaded(ctx context.Context, uri resources.SnapshotURI) (bool, error) {
+	manifestURI, err := uri.ObjectURI(sandboxManifestName)
+	if err != nil {
+		return false, ateerrors.CrashIfReason(ctx, fmt.Errorf("while addressing snapshot manifest in GCS: %w", err), ateerrors.ReasonInvalidObjectURL)
+	}
+	if _, err := ategcs.FetchFromGCS(ctx, s.gcsClient, manifestURI); err != nil {
+		if errors.Is(err, ateerrors.ReasonFailedGetExternalObject) {
+			return false, nil
+		}
+		return false, fmt.Errorf("while probing for an already-uploaded snapshot manifest: %w", err)
+	}
+	return true, nil
+}
+
 func (s *AteomHerder) moveLocalCheckpoint(ctx context.Context, req *ateletpb.CheckpointRequest, checkpointDir string, rec *sandboxAssetsRecord) error {
 	localCheckpointPath := ateompath.LocalSnapshotDir(req.GetActorUid(), req.GetLocalConfig().GetSnapshotName())
 	if err := os.MkdirAll(localCheckpointPath, 0o700); err != nil {
@@ -645,12 +763,26 @@ func (s *AteomHerder) moveLocalCheckpoint(ctx context.Context, req *ateletpb.Che
 	}
 
 	// Move exactly the files ateom reported.
+	//
+	// A file already at the destination with nothing left at the source was
+	// moved by an earlier attempt at this same checkpoint: the rename is not
+	// repeatable, so re-entry has to recognize its own work rather than fail on
+	// the missing source. Only the manifest below commits the snapshot, so a
+	// half-moved set is exactly what an interrupted attempt leaves behind.
 	for _, fileName := range rec.SnapshotFiles {
 		src := filepath.Join(checkpointDir, fileName)
 		dst := filepath.Join(localCheckpointPath, fileName)
 		recordSnapshotSize(ctx, fileName, src, req.GetActorTemplateNamespace(), req.GetActorTemplateName())
 
-		if err := os.Rename(src, dst); err != nil {
+		err := os.Rename(src, dst)
+		if errors.Is(err, os.ErrNotExist) {
+			if _, statErr := os.Stat(dst); statErr == nil {
+				continue
+			}
+			// Gone from both sides: the snapshot cannot be assembled.
+			return wrapFileSystemErr(fmt.Sprintf("snapshot file %q is missing from both %s and %s", fileName, checkpointDir, localCheckpointPath), err)
+		}
+		if err != nil {
 			return fmt.Errorf("failed to move %s to %s: %w", src, dst, err)
 		}
 	}
@@ -756,8 +888,9 @@ func (s *AteomHerder) UploadPausedCheckpoint(ctx context.Context, req *ateletpb.
 	}
 
 	// The uploaded snapshot supersedes every local pause snapshot of this
-	// actor; free the node's disk (best-effort, like Checkpoint).
-	pruneLocalCheckpoints(ctx, req.GetActorUid())
+	// actor; free the node's disk (best-effort, like Checkpoint). Nothing is
+	// half-written here — the upload above is finished — so none are kept.
+	pruneLocalCheckpoints(ctx, req.GetActorUid(), "")
 
 	return &ateletpb.UploadPausedCheckpointResponse{}, nil
 }
@@ -767,11 +900,6 @@ func (s *AteomHerder) UploadPausedCheckpoint(ctx context.Context, req *ateletpb.
 // returns the sandbox class recorded in the snapshot manifest (empty when the
 // manifest was not read). Parameterized by localDir for tests.
 func (s *AteomHerder) uploadLocalCheckpointDir(ctx context.Context, req *ateletpb.UploadPausedCheckpointRequest, localDir string, uri resources.SnapshotURI) (string, error) {
-	manifestURI, err := uri.ObjectURI(sandboxManifestName)
-	if err != nil {
-		return "", fmt.Errorf("while addressing snapshot manifest in GCS: %w", err)
-	}
-
 	manifest, err := os.ReadFile(filepath.Join(localDir, sandboxManifestName))
 	if errors.Is(err, os.ErrNotExist) {
 		// The local snapshot is gone. A previous invocation may have uploaded
@@ -779,16 +907,16 @@ func (s *AteomHerder) uploadLocalCheckpointDir(ctx context.Context, req *ateletp
 		// means the whole snapshot is committed and this retry already
 		// succeeded. Absent on both sides, the paused actor's state is
 		// unrecoverable.
-		_, fetchErr := ategcs.FetchFromGCS(ctx, s.gcsClient, manifestURI)
-		if fetchErr == nil {
+		uploaded, probeErr := s.snapshotManifestUploaded(ctx, uri)
+		if probeErr != nil {
+			return "", probeErr
+		}
+		if uploaded {
 			slog.InfoContext(ctx, "Local snapshot already uploaded and pruned; nothing to do", slog.String("snapshot_uri", req.GetDestinationSnapshotUri()))
 			return "", nil
 		}
-		if errors.Is(fetchErr, ateerrors.ReasonFailedGetExternalObject) {
-			return "", ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonLocalSnapshotGone, ateerrors.ActorCrashedMetadata(),
-				fmt.Errorf("local snapshot %q is gone and no uploaded copy exists: %w", req.GetLocalSnapshotName(), fetchErr))
-		}
-		return "", fmt.Errorf("while probing for an already-uploaded snapshot manifest: %w", fetchErr)
+		return "", ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonLocalSnapshotGone, ateerrors.ActorCrashedMetadata(),
+			fmt.Errorf("%w: local snapshot %q is gone and no uploaded copy exists", ateerrors.ReasonLocalSnapshotGone, req.GetLocalSnapshotName()))
 	}
 	if err != nil {
 		return "", wrapFileSystemErr("while reading local snapshot manifest", err)

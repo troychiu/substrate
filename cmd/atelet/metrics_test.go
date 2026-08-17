@@ -168,6 +168,44 @@ func TestCheckpointDurationShape(t *testing.T) {
 	}
 }
 
+// A replayed checkpoint records no duration — it does none of the work the
+// phases measure — so the counter is the only trace it leaves. It carries the
+// same dimensions a real checkpoint does, so the two are comparable.
+func TestCheckpointReplayedShape(t *testing.T) {
+	inst, reader := newTestInstruments(t)
+
+	inst.recordCheckpointReplayed(context.Background(), snapshotOp{
+		templateNamespace: testTemplateNamespace,
+		templateName:      testTemplateName,
+		kind:              ateattr.SnapshotKindLocal,
+		scope:             ateattr.SnapshotScopeFull,
+	})
+
+	m := collectHistogram(t, reader, checkpointReplayedMetric)
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("%s is %T, want an int64 sum", m.Name, m.Data)
+	}
+	if len(sum.DataPoints) != 1 {
+		t.Fatalf("datapoints = %d, want 1", len(sum.DataPoints))
+	}
+	dp := sum.DataPoints[0]
+	if dp.Value != 1 {
+		t.Errorf("value = %d, want 1", dp.Value)
+	}
+	if v := attrString(t, dp.Attributes, ateattr.SnapshotKindKey); v != ateattr.SnapshotKindLocal {
+		t.Errorf("snapshot kind = %q, want %q", v, ateattr.SnapshotKindLocal)
+	}
+	if v := attrString(t, dp.Attributes, ateattr.SnapshotScopeKey); v != ateattr.SnapshotScopeFull {
+		t.Errorf("snapshot scope = %q, want %q", v, ateattr.SnapshotScopeFull)
+	}
+	// The replay never reads the on-node record, so the sandbox class is
+	// genuinely unknown and must be omitted rather than sent as "".
+	if _, ok := dp.Attributes.Value(ateattr.SandboxClassKey); ok {
+		t.Error("sandbox class present, want it omitted while unknown")
+	}
+}
+
 // TestRecordPhasesFailurePath is the failure-path contract: a restore that dies
 // in the download marks ate.failure.reason on that phase and on the total,
 // leaves the phases that already succeeded unlabeled so their latency stays
