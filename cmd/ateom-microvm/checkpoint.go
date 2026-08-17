@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -29,7 +30,9 @@ import (
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
+	"github.com/agent-substrate/substrate/internal/ateerrors"
 	"github.com/agent-substrate/substrate/internal/ateompath"
+	"github.com/agent-substrate/substrate/internal/checkpointmarker"
 	"github.com/agent-substrate/substrate/internal/imagecache"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/resources"
@@ -61,14 +64,56 @@ import (
 func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.CheckpointWorkloadRequest) (*ateompb.CheckpointWorkloadResponse, error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	if err := s.deactivateActorNetworking(ctx); err != nil {
-		return nil, err
-	}
 
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
 	actorUID := req.GetActorUid()
 	templateNS := req.GetActorTemplateNamespace()
 	templateName := req.GetActorTemplateName()
+
+	// A checkpoint that already completed is replayed from its marker rather
+	// than re-run: the first one tore the guest down, so there is nothing left
+	// to pause and snapshot (#372). Checked before anything else touches the
+	// actor, including the network teardown and the checkpoint-dir wipe below,
+	// which would destroy the very evidence this reads.
+	if rec, ok, err := checkpointmarker.Read(actorUID, req.GetScope().String()); err != nil {
+		return nil, err
+	} else if ok {
+		slog.InfoContext(ctx, "Checkpoint already completed for this actor; replaying its result",
+			slog.String("id", actorUID), slog.Any("snapshot_files", rec.SnapshotFiles))
+		// The marker is written before the teardown below, so an attempt that
+		// died in between left the VMM and its virtiofsds running, the actor
+		// still in s.running, and the actor network still up. Replaying the
+		// answer without finishing that teardown would strand the guest's
+		// memory on this node, let GetWorkloadStats report a checkpointed actor
+		// as running, and leave virtiofsd serving bundle dirs that atelet wipes
+		// as soon as it has this response. The teardown is best-effort and
+		// safe to repeat, so it runs here whether or not the first attempt got
+		// to it.
+		//
+		// Unless the ateom has moved on. Parts of the teardown are the ateom's,
+		// not the actor's — the interior network, the stats attribution — so
+		// running it for an actor this ateom no longer holds would cut the
+		// network out from under whoever holds it now. A marker outlives its
+		// attempt until resetActorDirs clears it, and a late retry can arrive
+		// after the ateom has been handed to someone else.
+		if held := s.activeActor.Load(); held != nil && held.UID != actorUID {
+			slog.WarnContext(ctx, "Not running the post-checkpoint teardown: this ateom now holds a different actor",
+				slog.String("id", actorUID), slog.String("active_actor_uid", held.UID))
+			return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: rec.SnapshotFiles}, nil
+		}
+		// A nil activeActor is not the reassignment case: it means nobody is
+		// holding this ateom, so there is nothing to protect, and a VMM the
+		// first attempt left running still needs shutting down. teardownActor
+		// reaches it through the conventional socket path when s.running has no
+		// record (ateom restarted).
+		ra := s.running[actorUID]
+		s.teardownAfterCheckpoint(ctx, actorUID, ra, ch.NewClient(chSocketFor(actorUID, ra)))
+		return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: rec.SnapshotFiles}, nil
+	}
+
+	if err := s.deactivateActorNetworking(ctx); err != nil {
+		return nil, err
+	}
 
 	s.actorLogger.EmitLifecycleLog("Actor checkpointing", actorRef, actorUID, templateNS, templateName)
 
@@ -96,12 +141,21 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// The actor's CH was booted by RunWorkload or relaunched by RestoreWorkload;
 	// either way ateom owns it and tracks its api-socket.
 	ra := s.running[actorUID]
-	chSocket := kata.CLHSocketPath(actorUID)
-	if ra != nil && ra.apiSocket != "" {
-		chSocket = ra.apiSocket
-	}
+	chSocket := chSocketFor(actorUID, ra)
 	client := ch.NewClient(chSocket)
 	if _, err := client.WaitReady(ctx, 10*time.Second); err != nil {
+		// WaitReady also fails on a VMM that is merely slow, which is worth
+		// retrying, so only the unambiguous case is called unrecoverable: no
+		// api-socket at all means no VMM to snapshot. Together with the absent
+		// marker above, that says the actor's state is gone rather than
+		// pending — the shape a replayed checkpoint takes when the first one
+		// tore the guest down but did not live to record it. Saying so with
+		// the crash directive stops the control plane retrying a call that can
+		// never succeed.
+		if _, statErr := os.Stat(chSocket); errors.Is(statErr, os.ErrNotExist) {
+			return nil, ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonInvalidCheckpointResult, ateerrors.ActorCrashedMetadata(),
+				fmt.Errorf("%w: no guest remains to checkpoint: api-socket %q is gone: %w", ateerrors.ReasonInvalidCheckpointResult, chSocket, err))
+		}
 		return nil, fmt.Errorf("while waiting for CH api-socket: %w", err)
 	}
 
@@ -151,8 +205,46 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		return nil, fmt.Errorf("while listing snapshot files: %w", err)
 	}
 
+	// Record the result before the teardown below and before answering, so a
+	// caller that never sees this response can ask again and be told the same
+	// thing. From here on the checkpoint is a fact on disk.
+	if err := checkpointmarker.Write(actorUID, req.GetScope().String(), snapshotFiles); err != nil {
+		return nil, err
+	}
+
 	// Tear down: the actor returns to "available". Best-effort; the snapshot is
 	// already on disk for atelet to ship.
+	dTeardown := s.teardownAfterCheckpoint(ctx, actorUID, ra, client)
+
+	s.actorLogger.EmitLifecycleLog("Actor checkpointed", actorRef, actorUID, templateNS, templateName)
+	slog.InfoContext(ctx, "Actor checkpointed", slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
+		slog.String("scope", scope.String()), slog.Duration("pause", dPause),
+		slog.Duration("snapshot", dSnapshot),
+		// The durable-dir tar runs while the guest is paused, so its cost is part
+		// of the suspend latency and scales with the volume's contents.
+		slog.Duration("durable_dir", dDurable), slog.Duration("teardown", dTeardown))
+	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
+}
+
+// chSocketFor returns the actor's CH api-socket: the one ateom recorded when it
+// launched the VMM, or the conventional path when ateom has no in-memory record
+// of the actor (it restarted, or the actor is already torn down).
+func chSocketFor(actorUID string, ra *runningActor) string {
+	if ra != nil && ra.apiSocket != "" {
+		return ra.apiSocket
+	}
+	return kata.CLHSocketPath(actorUID)
+}
+
+// teardownAfterCheckpoint releases what a checkpointed actor still holds on
+// this ateom — the CH VMM and its virtiofsds, the running-actor entry, the
+// stats attribution, and the actor network — and returns how long the teardown
+// itself took.
+//
+// Every step is best-effort (the snapshot is already on disk) and safe to
+// repeat, which is what lets the replay path run it against a teardown an
+// earlier attempt may have half-finished.
+func (s *AteomService) teardownAfterCheckpoint(ctx context.Context, actorUID string, ra *runningActor, client *ch.Client) time.Duration {
 	tTeardown := time.Now()
 	s.teardownActor(ctx, actorUID, ra, client)
 	dTeardown := time.Since(tTeardown)
@@ -163,7 +255,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// would let a later GetWorkloadStats report a checkpointed actor as though it
 	// were still running.
 	//
-	// Nothing above this point clears it, unlike the gVisor ateom, which clears
+	// Nothing before this point clears it, unlike the gVisor ateom, which clears
 	// as soon as its checkpoint call has taken the sandbox down. Here the guest
 	// is only paused until this teardown, so a checkpoint that failed earlier has
 	// left it present, and reporting its usage is then the honest answer. This is
@@ -175,15 +267,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	if err := ateomnet.CleanupActorNetwork(ctx, s.interiorNetNS); err != nil {
 		slog.WarnContext(ctx, "Failed to clean up actor network after checkpoint", slog.Any("err", err))
 	}
-
-	s.actorLogger.EmitLifecycleLog("Actor checkpointed", actorRef, actorUID, templateNS, templateName)
-	slog.InfoContext(ctx, "Actor checkpointed", slog.String("id", actorUID), slog.Any("snapshot_files", snapshotFiles),
-		slog.String("scope", scope.String()), slog.Duration("pause", dPause),
-		slog.Duration("snapshot", dSnapshot),
-		// The durable-dir tar runs while the guest is paused, so its cost is part
-		// of the suspend latency and scales with the volume's contents.
-		slog.Duration("durable_dir", dDurable), slog.Duration("teardown", dTeardown))
-	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
+	return dTeardown
 }
 
 // snapshotVMState captures the paused guest into checkpointDir: the CH snapshot
@@ -252,7 +336,9 @@ func listFiles(dir string) ([]string, error) {
 	}
 	var files []string
 	for _, e := range entries {
-		if e.Type().IsRegular() {
+		// ateom's own completion marker shares the directory but is
+		// bookkeeping, not snapshot content, so it never joins the set.
+		if e.Type().IsRegular() && e.Name() != ateompath.CheckpointDoneFileName {
 			files = append(files, e.Name())
 		}
 	}

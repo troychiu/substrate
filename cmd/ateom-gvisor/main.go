@@ -35,11 +35,13 @@ import (
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/agent-substrate/substrate/internal/actorlog"
+	"github.com/agent-substrate/substrate/internal/ateerrors"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/ateomnet"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/ateomstats"
 	"github.com/agent-substrate/substrate/internal/atunnel"
+	"github.com/agent-substrate/substrate/internal/checkpointmarker"
 	"github.com/agent-substrate/substrate/internal/contextlogging"
 	"github.com/agent-substrate/substrate/internal/imagecache"
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
@@ -679,11 +681,27 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	s.setActiveRPC(rpcCheckpointWorkload, cancel)
 	defer s.clearActiveRPC()
 
+	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+
+	// A checkpoint that already completed is replayed from its marker rather
+	// than re-run: the first one took the sandbox down, so driving runsc again
+	// would fail against state that no longer exists (#372). Checked before
+	// anything else touches the actor, including the network teardown below,
+	// which the completed checkpoint already did.
+	if rec, ok, err := checkpointmarker.Read(req.GetActorUid(), req.GetScope().String()); err != nil {
+		return nil, err
+	} else if ok {
+		slog.InfoContext(ctx, "Checkpoint already completed for this actor; replaying its result",
+			"actor", actorRef,
+			"actorUID", req.GetActorUid(),
+			"snapshotFiles", rec.SnapshotFiles)
+		return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: rec.SnapshotFiles}, nil
+	}
+
 	if err := s.deactivateActorNetworking(ctx); err != nil {
 		return nil, err
 	}
 
-	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
 	s.actorLogger.EmitLifecycleLog("Actor checkpointing", actorRef, req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
 
 	// Contract with atelet:
@@ -715,12 +733,12 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 			return nil, fmt.Errorf("no durable-dir volumes found for DATA snapshot")
 		}
 		if err := rcmd.cmdFsCheckpoint(ctx, "pause", checkpointPath, ddv); err != nil {
-			return nil, fmt.Errorf("while fscheckpointing durable-dir %q: %w", ddv[0], err)
+			return nil, classifyCheckpointFailure(ctx, rcmd, fmt.Errorf("while fscheckpointing durable-dir %q: %w", ddv[0], err))
 		}
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_FULL:
 		// Checkpoint pause container (root of the sandbox)
 		if err := rcmd.cmdCheckpoint(ctx, "pause", checkpointPath); err != nil {
-			return nil, fmt.Errorf("while checkpointing pause: %w", err)
+			return nil, classifyCheckpointFailure(ctx, rcmd, fmt.Errorf("while checkpointing pause: %w", err))
 		}
 	default:
 		return nil, fmt.Errorf("unsupported snapshot scope: %v", req.GetScope())
@@ -771,14 +789,87 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		return nil, fmt.Errorf("while listing checkpoint files: %w", err)
 	}
 
+	// Record the result before answering, so a caller that never sees this
+	// response can ask again and be told the same thing. Written last: from
+	// here on the checkpoint is a fact on disk, whatever happens to the reply.
+	if err := checkpointmarker.Write(req.GetActorUid(), req.GetScope().String(), snapshotFiles); err != nil {
+		return nil, err
+	}
+
 	s.actorLogger.EmitLifecycleLog("Actor checkpointed", actorRef, req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
 	s.activeSession = nil
 
 	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
 }
 
+// stateProbeTimeout bounds the probe below. `runsc state` talks to the
+// sandbox's control server, which after a checkpoint may never answer; the
+// probe needs a deadline of its own so an unresponsive sandbox cannot hold the
+// classification open for as long as the caller would allow.
+const stateProbeTimeout = 15 * time.Second
+
+// classifyCheckpointFailure decides whether a failed checkpoint left the actor
+// recoverable. A checkpoint command can fail with the sandbox still up (a
+// transient runsc error, worth retrying) or with the sandbox already gone —
+// the shape a replayed checkpoint takes when the first one destroyed the
+// sandbox but crashed before its marker landed, which no retry can ever
+// satisfy. Probing the pause container tells the two apart, so the control
+// plane sees "this actor's state is unrecoverable" instead of an opaque
+// `runsc` exit status.
+//
+// The verdict is asymmetric on purpose. "Retriable" is the recoverable
+// mistake: a retry that finds no sandbox arrives back here and is classified
+// then. "Unrecoverable" is not — it crashes the actor permanently — so it is
+// returned only on positive evidence that the sandbox is gone, never on a
+// probe that merely failed to reach it.
+//
+// The probe runs only on the failure path: the happy path must not pay for an
+// extra runsc invocation.
+func classifyCheckpointFailure(ctx context.Context, rcmd *runsc, err error) error {
+	// Probe on a context of its own. The failure being classified may itself BE
+	// the caller's ctx expiring, and on an expired ctx the probe cannot run at
+	// all — reading that as "the sandbox is gone" would turn every checkpoint
+	// that misses its deadline into permanent data loss.
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stateProbeTimeout)
+	defer cancel()
+
+	out, stateErr := rcmd.cmdStateOutput(probeCtx, "pause")
+	if stateErr == nil {
+		return err
+	}
+	if !sandboxNotFound(out) {
+		// `runsc state` fails for plenty of reasons that say nothing about
+		// whether the sandbox survived: an unusable runsc path, the probe
+		// timing out, or a control server that has stopped answering — which is
+		// expected right after a checkpoint takes the sandbox root down (see
+		// cleanupContainersAfterCheckpoint's caller). Keep the original,
+		// retriable error for all of them.
+		slog.WarnContext(ctx, "Checkpoint failed and the sandbox state could not be determined; leaving the failure retriable",
+			"actorUID", rcmd.actorUID, "stateErr", stateErr, "runscOutput", string(out), "err", err)
+		return err
+	}
+	slog.WarnContext(ctx, "Checkpoint failed and the sandbox is gone; the actor's state is unrecoverable",
+		"actorUID", rcmd.actorUID, "stateErr", stateErr, "err", err)
+	return ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonInvalidCheckpointResult, ateerrors.ActorCrashedMetadata(),
+		fmt.Errorf("%w: checkpoint failed and no sandbox remains to retry against: %w", ateerrors.ReasonInvalidCheckpointResult, err))
+}
+
+// sandboxNotFound reports whether runsc's output says the container it was
+// asked about is not there — the one `runsc state` failure that is evidence
+// the sandbox is gone rather than merely unreachable.
+//
+// This reads runsc's message because its exit status does not distinguish the
+// cases. Failing to match is the safe direction (the checkpoint error stays
+// retriable), so the match stays on runsc's own phrasing rather than anything
+// looser that might catch an unrelated error.
+func sandboxNotFound(runscOutput []byte) bool {
+	return strings.Contains(strings.ToLower(string(runscOutput)), "does not exist")
+}
+
 // listSnapshotFiles returns the (relative) names of regular files directly under
-// dir, which atelet ships to object storage as the snapshot.
+// dir, which atelet ships to object storage as the snapshot. ateom's own
+// completion marker shares the directory but is bookkeeping, not snapshot
+// content, so it never joins the set.
 func listSnapshotFiles(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -786,7 +877,7 @@ func listSnapshotFiles(dir string) ([]string, error) {
 	}
 	var files []string
 	for _, e := range entries {
-		if e.Type().IsRegular() {
+		if e.Type().IsRegular() && e.Name() != ateompath.CheckpointDoneFileName {
 			files = append(files, e.Name())
 		}
 	}
