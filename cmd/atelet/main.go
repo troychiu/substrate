@@ -535,6 +535,17 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	}
 	defer release()
 
+	// The dimensions both paths below report under. Built before the
+	// fast-forward so a replay can be counted with the same attributes a real
+	// checkpoint carries; sandboxClass joins it later, once the on-node record
+	// has been read, and attrs() omits it while it is unknown.
+	op := snapshotOp{
+		templateNamespace: req.GetActorTemplateNamespace(),
+		templateName:      req.GetActorTemplateName(),
+		kind:              checkpointSnapshotKind(req),
+		scope:             ateattr.SnapshotScopeValue(req.GetScope()),
+	}
+
 	// A checkpoint whose snapshot is already at its destination is done, and
 	// re-running it would drive a sandbox the first attempt destroyed (#372).
 	// The control plane mints the destination once per suspend/pause and
@@ -550,17 +561,6 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	// Costs one small object read per external checkpoint. That is paid before
 	// the guest is paused, against an operation that goes on to move
 	// gigabytes.
-	// The dimensions both paths below report under. Built before the
-	// fast-forward so a replay can be counted with the same attributes a real
-	// checkpoint carries; sandboxClass joins it later, once the on-node record
-	// has been read, and attrs() omits it while it is unknown.
-	op := snapshotOp{
-		templateNamespace: req.GetActorTemplateNamespace(),
-		templateName:      req.GetActorTemplateName(),
-		kind:              checkpointSnapshotKind(req),
-		scope:             ateattr.SnapshotScopeValue(req.GetScope()),
-	}
-
 	committed, err := s.checkpointAlreadyCommitted(ctx, req)
 	if err != nil {
 		return nil, err
