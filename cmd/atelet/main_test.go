@@ -1815,6 +1815,59 @@ func TestMoveLocalCheckpointResumesPartialMove(t *testing.T) {
 	}
 }
 
+// checkpointAlreadyCommitted reads the manifest's mere presence as proof the
+// snapshot is complete, so the snapshot dir must hold nothing else that could
+// be mistaken for it and nothing left over from writing it: the manifest is
+// renamed into place from a temp file in the same directory, and a temp file
+// that outlived its write would join the snapshot's own contents.
+func TestMoveLocalCheckpointLeavesOnlyTheCommittedSnapshot(t *testing.T) {
+	useTempActorsDir(t)
+
+	req := validCheckpointRequest()
+	req.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
+	req.Config = &ateletpb.CheckpointRequest_LocalConfig{
+		LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "pause-snap-1"},
+	}
+	rec := &sandboxAssetsRecord{SandboxClass: "gvisor", PauseImage: testPauseImage, SnapshotFiles: []string{"checkpoint.img"}}
+
+	checkpointDir := ateompath.CheckpointStateDir(req.GetActorUid())
+	if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
+		t.Fatalf("creating checkpoint dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(checkpointDir, "checkpoint.img"), []byte("img"), 0o600); err != nil {
+		t.Fatalf("writing checkpoint.img: %v", err)
+	}
+
+	if err := (&AteomHerder{}).moveLocalCheckpoint(context.Background(), req, checkpointDir, rec); err != nil {
+		t.Fatalf("moveLocalCheckpoint: %v", err)
+	}
+
+	dstDir := ateompath.LocalSnapshotDir(req.GetActorUid(), "pause-snap-1")
+	entries, err := os.ReadDir(dstDir)
+	if err != nil {
+		t.Fatalf("reading snapshot dir: %v", err)
+	}
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.Name())
+	}
+	slices.Sort(got)
+	want := []string{"checkpoint.img", sandboxManifestName}
+	if !slices.Equal(got, want) {
+		t.Errorf("snapshot dir = %v, want exactly %v", got, want)
+	}
+
+	// A manifest that is present but unreadable is the state the fast-forward
+	// cannot detect, so it must never be committed.
+	manifest, err := os.ReadFile(filepath.Join(dstDir, sandboxManifestName))
+	if err != nil {
+		t.Fatalf("reading manifest: %v", err)
+	}
+	if _, err := unmarshalSandboxRecord(manifest); err != nil {
+		t.Errorf("unmarshalSandboxRecord: %v, want the committed manifest to parse", err)
+	}
+}
+
 func TestMoveLocalCheckpointFailsWhenFileGoneFromBothSides(t *testing.T) {
 	useTempActorsDir(t)
 

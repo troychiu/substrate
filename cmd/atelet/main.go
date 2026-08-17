@@ -815,11 +815,19 @@ func (s *AteomHerder) moveLocalCheckpoint(ctx context.Context, req *ateletpb.Che
 	}
 
 	// Write the self-describing snapshot manifest beside the images.
+	//
+	// Atomically, because this file is what commits the snapshot:
+	// checkpointAlreadyCommitted reads its presence as proof that every file it
+	// names is in place. os.WriteFile truncates before it writes, so a node that
+	// died mid-write would leave an empty manifest that the next attempt would
+	// fast-forward over, reporting a checkpoint whose manifest cannot be parsed
+	// — a failure that would only surface later, at upload or restore, as
+	// unrecoverable. A crash now leaves the previous state instead.
 	manifest, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("while marshaling snapshot manifest: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(localCheckpointPath, sandboxManifestName), manifest, 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(localCheckpointPath, sandboxManifestName), manifest, 0o600); err != nil {
 		return fmt.Errorf("while writing snapshot manifest: %w", err)
 	}
 
@@ -1888,9 +1896,13 @@ func validateUploadPausedCheckpointRequest(req *ateletpb.UploadPausedCheckpointR
 
 // writeFileAtomic writes data to path by writing a temp file in the same
 // directory, syncing, and renaming it over the target, then syncing the
-// parent directory so the rename is durable. The identity directory is
-// bind-mounted into actors, so the file must change atomically: a reader
-// must never observe a truncated or partially written value.
+// parent directory so the rename is durable, so that no reader ever observes a
+// truncated or partially written value.
+//
+// Its callers are the files where a half-written value would be believed: the
+// identity directory is bind-mounted into actors, which read it live, and the
+// local snapshot manifest is what commits a checkpoint, so a truncated one
+// would be read by a later attempt as a snapshot that is complete.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
