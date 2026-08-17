@@ -208,6 +208,11 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// Record the result before the teardown below and before answering, so a
 	// caller that never sees this response can ask again and be told the same
 	// thing. From here on the checkpoint is a fact on disk.
+	//
+	// Failing here is safe, unlike in the gVisor ateom: the guest is only
+	// paused until the teardown below, so a retry re-runs this checkpoint from
+	// the top and succeeds. Refusing to answer without a marker therefore costs
+	// nothing and keeps the response and the marker in step.
 	if err := checkpointmarker.Write(actorUID, req.GetScope().String(), snapshotFiles); err != nil {
 		return nil, err
 	}

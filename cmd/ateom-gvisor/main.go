@@ -803,8 +803,26 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// Record the result before answering, so a caller that never sees this
 	// response can ask again and be told the same thing. Written last: from
 	// here on the checkpoint is a fact on disk, whatever happens to the reply.
+	//
+	// A marker that cannot be written is logged and no more: it buys re-entry,
+	// it is not what makes the checkpoint valid. By this point the snapshot is
+	// complete on disk and the sandbox is gone, so failing here would withhold
+	// a file list nobody can produce again — atelet would never ship the
+	// snapshot, and the retry would find no sandbox and crash the actor.
+	// Answering leaves only the narrower risk the marker exists to cover: a
+	// response that goes missing. ENOSPC is the case to expect, the checkpoint
+	// above having just written its images to this same filesystem.
+	//
+	// The micro-VM ateom does the opposite and fails, because there the guest
+	// is merely paused until the teardown that follows: its checkpoint can be
+	// re-run in full, so refusing to answer without a marker costs nothing and
+	// keeps the response and the marker in step.
 	if err := checkpointmarker.Write(req.GetActorUid(), req.GetScope().String(), snapshotFiles); err != nil {
-		return nil, err
+		slog.ErrorContext(ctx, "Failed to record the checkpoint completion marker; answering anyway, but a lost response can no longer be replayed",
+			"actor", actorRef,
+			"actorUID", req.GetActorUid(),
+			"snapshotFiles", snapshotFiles,
+			"err", err)
 	}
 
 	s.actorLogger.EmitLifecycleLog("Actor checkpointed", actorRef, req.GetActorUid(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
