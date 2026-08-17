@@ -688,7 +688,11 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	}
 	dPersist = time.Since(tPersist)
 
-	if err := s.finishCheckpoint(ctx, actorUID, req.GetSpec().GetVolumes()); err != nil {
+	// Assigns the named return rather than a fresh err, so the metrics defer
+	// above sees this failure: a checkpoint that dies unmounting volumes is a
+	// failed checkpoint, and binding a new err here would have it recorded as
+	// a successful one with no error.type at all.
+	if err = s.finishCheckpoint(ctx, actorUID, req.GetSpec().GetVolumes()); err != nil {
 		return nil, err
 	}
 
