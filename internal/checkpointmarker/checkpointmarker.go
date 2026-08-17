@@ -131,8 +131,14 @@ func Write(actorUID, scope string, snapshotFiles []string) error {
 // the request falls through to the ordinary path, where the runtime finds no
 // sandbox to checkpoint and says so as unrecoverable. That is the honest
 // answer for a differently-scoped checkpoint of an actor whose sandbox an
-// earlier one already destroyed, and it is the marker's own record of that
-// earlier checkpoint, still valid for its own retries, so it is not discarded.
+// earlier one already destroyed.
+//
+// Leaving it alone is about what Read may do, not about how long the marker
+// survives: a record Read cannot use is still not Read's to delete, unlike the
+// damaged one below that nobody can use. The fall-through usually removes it
+// moments later anyway — both runtimes clear the checkpoint dir before taking
+// a checkpoint — so this is not a promise that a mismatched marker outlives
+// the call.
 func Read(actorUID, scope string) (_ *Record, ok bool, _ error) {
 	path := ateompath.CheckpointDoneFile(actorUID)
 	data, err := os.ReadFile(path)

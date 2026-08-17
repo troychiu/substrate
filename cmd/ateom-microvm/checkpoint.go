@@ -232,13 +232,42 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 }
 
 // chSocketFor returns the actor's CH api-socket: the one ateom recorded when it
-// launched the VMM, or the conventional path when ateom has no in-memory record
+// launched the VMM, or a conventional path when ateom has no in-memory record
 // of the actor (it restarted, or the actor is already torn down).
+//
+// Without a record there are two conventions to choose between, because
+// RunWorkload and RestoreWorkload launch their VMMs on different paths, and
+// nothing left on the node says which one this actor came up through. So the
+// socket that exists wins. Guessing the boot path for a restored actor would
+// aim a shutdown at a socket its VMM never listened on — and would have the
+// caller below read "this path is absent" as "no guest remains", crashing an
+// actor whose VMM is alive on the other one.
 func chSocketFor(actorUID string, ra *runningActor) string {
+	return firstExistingPath(chSocketCandidates(actorUID, ra))
+}
+
+// chSocketCandidates lists the api-socket paths the actor's VMM could be
+// listening on, likeliest first. One when ateom knows which socket it launched
+// the VMM on; otherwise both conventions, since the record is what would have
+// said whether this actor was booted or restored.
+func chSocketCandidates(actorUID string, ra *runningActor) []string {
 	if ra != nil && ra.apiSocket != "" {
-		return ra.apiSocket
+		return []string{ra.apiSocket}
 	}
-	return kata.CLHSocketPath(actorUID)
+	return []string{kata.CLHSocketPath(actorUID), kata.RestoredCLHSocketPath(actorUID)}
+}
+
+// firstExistingPath returns the first candidate that is present, or the first
+// candidate when none is. None being present is an answer in itself — the
+// caller reads it as the guest being gone — so the likeliest path is returned
+// for the error to name.
+func firstExistingPath(candidates []string) string {
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return candidates[0]
 }
 
 // teardownAfterCheckpoint releases what a checkpointed actor still holds on

@@ -19,9 +19,11 @@ package main
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
+	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/kata"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/ateomstats"
 	"github.com/agent-substrate/substrate/internal/checkpointmarker"
@@ -89,5 +91,47 @@ func TestCheckpointWorkloadReplaySkipsTeardownForAReassignedAteom(t *testing.T) 
 	}
 	if got := s.guestStats.Load(); got == nil || got.actorUID != successor.UID {
 		t.Errorf("guestStats = %v, want the successor's target left untouched", got)
+	}
+}
+
+// RunWorkload and RestoreWorkload launch their VMMs on different api-socket
+// paths, so with no record of which one this actor came up through, ateom
+// cannot assume the boot path. Guessing wrong aims the teardown at a socket
+// nothing is listening on, and has CheckpointWorkload read that absence as "no
+// guest remains" and crash an actor whose VMM is alive on the other socket.
+func TestCHSocketCandidates(t *testing.T) {
+	const actorUID = "actor-1"
+
+	t.Run("no record covers both conventions", func(t *testing.T) {
+		got := chSocketCandidates(actorUID, nil)
+		want := []string{kata.CLHSocketPath(actorUID), kata.RestoredCLHSocketPath(actorUID)}
+		if !slices.Equal(got, want) {
+			t.Errorf("chSocketCandidates = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a recorded socket settles it", func(t *testing.T) {
+		got := chSocketCandidates(actorUID, &runningActor{apiSocket: "/run/recorded.sock"})
+		if !slices.Equal(got, []string{"/run/recorded.sock"}) {
+			t.Errorf("chSocketCandidates = %v, want only the recorded socket", got)
+		}
+	})
+}
+
+func TestFirstExistingPath(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "clh-api.sock")
+	present := filepath.Join(dir, "clh-api-restore.sock")
+	if err := os.WriteFile(present, nil, 0o600); err != nil {
+		t.Fatalf("creating socket file: %v", err)
+	}
+
+	if got := firstExistingPath([]string{missing, present}); got != present {
+		t.Errorf("firstExistingPath = %q, want the one that exists (%q)", got, present)
+	}
+	// None of them present is an answer too: the caller reads it as the guest
+	// being gone, so the likeliest path is what the error should name.
+	if got := firstExistingPath([]string{missing, missing + ".2"}); got != missing {
+		t.Errorf("firstExistingPath = %q, want the likeliest path %q", got, missing)
 	}
 }

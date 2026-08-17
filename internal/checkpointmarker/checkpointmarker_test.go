@@ -201,9 +201,10 @@ func TestReadRejectsMarkerFromADifferentScope(t *testing.T) {
 			if ok || rec != nil {
 				t.Errorf("Read = (%v, %v), want (nil, false)", rec, ok)
 			}
-			// Unlike a damaged marker, a mismatched one is still a valid
-			// record of the checkpoint that wrote it, and its own retries
-			// need it. It stays until resetActorDirs clears it.
+			// Unlike a damaged marker, a mismatched one is a valid record of
+			// the checkpoint that wrote it, so it is not Read's to delete.
+			// (Its caller will usually clear the checkpoint dir moments
+			// later; that is the caller's decision, not this one's.)
 			if _, err := os.Stat(path); err != nil {
 				t.Errorf("marker removed (err=%v), want it left in place", err)
 			}
