@@ -720,9 +720,15 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// and its half-written images would otherwise survive: listSnapshotFiles
 	// reports the union of both attempts, so the manifest — and the image
 	// directory a later restore is handed — would carry pages from a checkpoint
-	// that never completed. Nothing worth keeping is here: the completed
-	// checkpoint's marker lives in this dir too, and reaching this line means
-	// the replay above did not find one.
+	// that never completed.
+	//
+	// An unmarked dir is not proof that no checkpoint completed: the marker
+	// write below is allowed to fail. So this can also be a complete snapshot
+	// whose marker never landed and whose response went missing — and it is
+	// deleted, deliberately. The two states are indistinguishable from here,
+	// and that one is already lost: atelet never received the file list, so
+	// nothing can name those images again. Keeping them would only trade a
+	// certain bug (stale pages joining the next snapshot) for a dead copy.
 	if err := os.RemoveAll(checkpointPath); err != nil {
 		return nil, fmt.Errorf("while clearing checkpoint directory: %w", err)
 	}
