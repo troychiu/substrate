@@ -370,6 +370,9 @@ type AteomHerder struct {
 	mu                    sync.RWMutex
 	volumePlugins         map[string]volume.VolumePluginWorkerPlane
 	csiDriverConfigLister listersv1alpha1.CSIDriverConfigLister
+
+	// Serializes Checkpoint per actor; see actorLocks. Zero value is usable.
+	actorLocks actorLocks
 }
 
 var _ ateletpb.AteomHerderServer = (*AteomHerder)(nil)
@@ -507,6 +510,30 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 
 	actorUID := req.GetActorUid()
 	actorRef := resources.ActorRef{Atespace: req.GetAtespace(), Name: req.GetActorName()}
+
+	// One checkpoint per actor at a time. Two attempts can be in flight at
+	// once — a lease expires, a new leader retries while the original handler
+	// is still uploading and its connection is alive — and the recovery paths
+	// below are what make that dangerous rather than merely wasteful: the
+	// second attempt now runs to completion instead of dying at ateom, and its
+	// finishCheckpoint wipes the checkpoint dir the first attempt is still
+	// reading from. The first then fails mid-upload and crashes an actor whose
+	// snapshot did commit.
+	//
+	// Held for the whole call, including the fast-forward below, so the
+	// committed-check and the teardown it leads to cannot interleave with
+	// another attempt's persist.
+	release, locked := s.actorLocks.tryLock(actorUID)
+	if !locked {
+		// Retriable, and deliberately not a queued wait: a second attempt has
+		// nothing to contribute while the first is moving gigabytes, and
+		// holding the RPC open for that long only risks the caller timing out
+		// on a call that was never doing anything. By the time the control
+		// plane retries, the first attempt has usually committed and the
+		// fast-forward below answers immediately.
+		return nil, status.Errorf(codes.Aborted, "a checkpoint for actor %s is already in progress on this node", actorUID)
+	}
+	defer release()
 
 	// A checkpoint whose snapshot is already at its destination is done, and
 	// re-running it would drive a sandbox the first attempt destroyed (#372).

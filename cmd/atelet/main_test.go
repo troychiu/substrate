@@ -1837,3 +1837,72 @@ func TestMoveLocalCheckpointFailsWhenFileGoneFromBothSides(t *testing.T) {
 		t.Errorf("err = %v, want it tagged %v", err, ateerrors.ReasonTerminalFileSystemError)
 	}
 }
+
+func TestActorLocks(t *testing.T) {
+	var l actorLocks // zero value, as embedded in AteomHerder
+
+	release, ok := l.tryLock("actor-a")
+	if !ok {
+		t.Fatal("tryLock on a free actor returned false")
+	}
+	if _, ok := l.tryLock("actor-a"); ok {
+		t.Error("tryLock on a held actor returned true")
+	}
+	// Locks are per actor: a busy actor must not block any other.
+	releaseB, ok := l.tryLock("actor-b")
+	if !ok {
+		t.Error("tryLock on a different actor returned false")
+	}
+	releaseB()
+
+	release()
+	release() // idempotent: a second release must not free a later holder's claim
+	if _, ok := l.tryLock("actor-a"); !ok {
+		t.Error("tryLock after release returned false")
+	}
+
+	// Released entries are dropped rather than accumulating one per actor seen.
+	l.mu.Lock()
+	held := len(l.held)
+	l.mu.Unlock()
+	if held != 1 {
+		t.Errorf("held = %d entries, want 1 (only the outstanding lock)", held)
+	}
+}
+
+// Recovering a lost response made a re-entered Checkpoint succeed instead of
+// dying at ateom, which means two attempts at one actor can now both reach the
+// teardown that wipes the checkpoint dir the other is still uploading from.
+// The second attempt has to be turned away rather than run alongside the first.
+func TestCheckpointRejectsConcurrentAttemptForSameActor(t *testing.T) {
+	useTempActorsDir(t)
+	// Empty storage, so the commit probe answers "not committed" and the
+	// unblocked actor below goes on to fail for its own reasons rather than
+	// short-circuiting through the fast-forward.
+	s := &AteomHerder{gcsClient: &recordingObjectStorage{}}
+
+	req := validCheckpointRequest()
+	release, ok := s.actorLocks.tryLock(req.GetActorUid())
+	if !ok {
+		t.Fatal("could not take the actor lock to stand in for an in-flight checkpoint")
+	}
+	defer release()
+
+	_, err := s.Checkpoint(context.Background(), req)
+	if status.Code(err) != codes.Aborted {
+		t.Errorf("Checkpoint code = %v (err=%v), want %v", status.Code(err), err, codes.Aborted)
+	}
+	// Aborted is retriable and must not carry the crash directive: the actor is
+	// fine, another attempt simply holds it.
+	if ateerrors.ActorCrashRequested(err) {
+		t.Error("the concurrent-attempt rejection asks the control plane to crash the actor")
+	}
+
+	// A different actor on the same node is unaffected. It fails for its own
+	// reasons (no sandbox record, no dialer); it must not fail as concurrent.
+	other := validCheckpointRequest()
+	other.ActorUid = "123e4567-e89b-12d3-a456-426614174001"
+	if _, err := s.Checkpoint(context.Background(), other); status.Code(err) == codes.Aborted {
+		t.Error("a checkpoint for a different actor was rejected as concurrent")
+	}
+}
