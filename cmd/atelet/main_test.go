@@ -1603,7 +1603,7 @@ func TestCheckpointAlreadyCommitted(t *testing.T) {
 
 	t.Run("external with an uploaded manifest", func(t *testing.T) {
 		s := &AteomHerder{gcsClient: &recordingObjectStorage{
-			objects: map[string][]byte{manifestKey: []byte(`{"pauseImage":"pause:v1"}`)},
+			objects: map[string][]byte{manifestKey: []byte(`{"pauseImage":"pause:v1","scope":"full"}`)},
 		}}
 
 		got, err := s.checkpointAlreadyCommitted(ctx, validCheckpointRequest())
@@ -1612,6 +1612,57 @@ func TestCheckpointAlreadyCommitted(t *testing.T) {
 		}
 		if !got {
 			t.Error("committed = false, want true: the manifest is the commit marker")
+		}
+	})
+
+	// The destination is minted once per operation and re-sent on every
+	// re-entry, but the scope is re-derived from the live ActorTemplate each
+	// time. A template edited between two attempts therefore aims a Full
+	// checkpoint at a destination holding a Data snapshot; answering
+	// "committed" would report guest memory that was never captured.
+	t.Run("external manifest recording a different scope", func(t *testing.T) {
+		s := &AteomHerder{gcsClient: &recordingObjectStorage{
+			objects: map[string][]byte{manifestKey: []byte(`{"pauseImage":"pause:v1","scope":"data"}`)},
+		}}
+
+		req := validCheckpointRequest() // FULL
+		got, err := s.checkpointAlreadyCommitted(ctx, req)
+		if err != nil {
+			t.Fatalf("checkpointAlreadyCommitted: %v", err)
+		}
+		if got {
+			t.Errorf("committed = true, want false: the destination holds a %s snapshot, not the %s one asked for",
+				ateattr.SnapshotScopeData, ateattr.SnapshotScopeValue(req.GetScope()))
+		}
+	})
+
+	// Written before the scope was recorded in the manifest. It cannot be
+	// matched, so it cannot answer for this checkpoint.
+	t.Run("external manifest with no scope recorded", func(t *testing.T) {
+		s := &AteomHerder{gcsClient: &recordingObjectStorage{
+			objects: map[string][]byte{manifestKey: []byte(`{"pauseImage":"pause:v1"}`)},
+		}}
+
+		got, err := s.checkpointAlreadyCommitted(ctx, validCheckpointRequest())
+		if err != nil {
+			t.Fatalf("checkpointAlreadyCommitted: %v", err)
+		}
+		if got {
+			t.Error("committed = true, want false: an unscoped manifest cannot be matched to this checkpoint")
+		}
+	})
+
+	t.Run("external manifest that cannot be parsed", func(t *testing.T) {
+		s := &AteomHerder{gcsClient: &recordingObjectStorage{
+			objects: map[string][]byte{manifestKey: []byte("not json")},
+		}}
+
+		got, err := s.checkpointAlreadyCommitted(ctx, validCheckpointRequest())
+		if err != nil {
+			t.Fatalf("checkpointAlreadyCommitted: %v", err)
+		}
+		if got {
+			t.Error("committed = true, want false: a manifest that cannot be read proves nothing")
 		}
 	})
 
@@ -1646,7 +1697,7 @@ func TestCheckpointAlreadyCommitted(t *testing.T) {
 			LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "pause-snap-1"},
 		}
 		writeLocalSnapshot(t, ateompath.LocalSnapshotDir(req.GetActorUid(), "pause-snap-1"),
-			sandboxAssetsRecord{SandboxClass: "gvisor", PauseImage: testPauseImage, SnapshotFiles: []string{"checkpoint.img"}},
+			sandboxAssetsRecord{SandboxClass: "gvisor", PauseImage: testPauseImage, SnapshotFiles: []string{"checkpoint.img"}, Scope: ateattr.SnapshotScopeFull},
 			map[string]string{"checkpoint.img": "img"})
 
 		got, err := (&AteomHerder{}).checkpointAlreadyCommitted(ctx, req)
@@ -1655,6 +1706,27 @@ func TestCheckpointAlreadyCommitted(t *testing.T) {
 		}
 		if !got {
 			t.Error("committed = false, want true")
+		}
+	})
+
+	t.Run("local snapshot recording a different scope", func(t *testing.T) {
+		useTempActorsDir(t)
+		req := validCheckpointRequest() // FULL
+		req.Type = ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL
+		req.Config = &ateletpb.CheckpointRequest_LocalConfig{
+			LocalConfig: &ateletpb.LocalCheckpointConfiguration{SnapshotName: "pause-snap-1"},
+		}
+		writeLocalSnapshot(t, ateompath.LocalSnapshotDir(req.GetActorUid(), "pause-snap-1"),
+			sandboxAssetsRecord{SandboxClass: "gvisor", PauseImage: testPauseImage, SnapshotFiles: []string{"durable-dir.tar"}, Scope: ateattr.SnapshotScopeData},
+			map[string]string{"durable-dir.tar": "tar"})
+
+		got, err := (&AteomHerder{}).checkpointAlreadyCommitted(ctx, req)
+		if err != nil {
+			t.Fatalf("checkpointAlreadyCommitted: %v", err)
+		}
+		if got {
+			t.Errorf("committed = true, want false: the destination holds a %s snapshot, not the %s one asked for",
+				ateattr.SnapshotScopeData, ateattr.SnapshotScopeValue(req.GetScope()))
 		}
 	})
 
@@ -1683,7 +1755,7 @@ func TestCheckpointFastForwardsWhenAlreadyCommitted(t *testing.T) {
 	useTempActorsDir(t)
 	s := &AteomHerder{gcsClient: &recordingObjectStorage{
 		objects: map[string][]byte{
-			"bucket/root/snapshots/ate-demo/counter-1-snap/manifest.json": []byte(`{"pauseImage":"pause:v1"}`),
+			"bucket/root/snapshots/ate-demo/counter-1-snap/manifest.json": []byte(`{"pauseImage":"pause:v1","scope":"full"}`),
 		},
 	}}
 

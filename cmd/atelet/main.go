@@ -743,13 +743,18 @@ func (s *AteomHerder) checkpointAlreadyCommitted(ctx context.Context, req *atele
 		if err != nil {
 			return false, ateerrors.CrashIfReason(ctx, err, ateerrors.ReasonInvalidObjectURL)
 		}
-		return s.snapshotManifestUploaded(ctx, uri)
+		manifest, uploaded, err := s.fetchUploadedSnapshotManifest(ctx, uri)
+		if err != nil || !uploaded {
+			return false, err
+		}
+		return committedManifestAnswers(ctx, manifest, req), nil
 
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
 		path := filepath.Join(ateompath.LocalSnapshotDir(req.GetActorUid(), req.GetLocalConfig().GetSnapshotName()), sandboxManifestName)
-		switch _, err := os.Stat(path); {
+		manifest, err := os.ReadFile(path)
+		switch {
 		case err == nil:
-			return true, nil
+			return committedManifestAnswers(ctx, manifest, req), nil
 		case errors.Is(err, os.ErrNotExist):
 			return false, nil
 		default:
@@ -764,23 +769,64 @@ func (s *AteomHerder) checkpointAlreadyCommitted(ctx context.Context, req *atele
 	}
 }
 
+// committedManifestAnswers reports whether the snapshot already at this
+// checkpoint's destination is the one being asked for.
+//
+// The destination alone does not settle that. The control plane mints it once
+// per suspend/pause and re-sends it on every re-entry, but it re-derives the
+// scope from the live ActorTemplate each time, so a template edited between
+// two attempts sends the same destination with a different scope. Answering
+// "committed" there would report a Full checkpoint over a Data-only file set,
+// and the ActorSnapshot recorded afterwards would claim guest memory the
+// objects do not contain — with nothing to restore from and no error anywhere
+// to say so. checkpointmarker.Read guards the same replay one layer down for
+// the same reason; the guard has to be here too, because this fast-forward
+// answers before ateom is ever called.
+//
+// A mismatch, an unparsable manifest, and one written before the scope was
+// recorded all report "not committed" and fall through to the ordinary path,
+// where the destroyed sandbox is reported as unrecoverable. That is the honest
+// answer: this checkpoint has not been taken, and cannot be.
+func committedManifestAnswers(ctx context.Context, manifest []byte, req *ateletpb.CheckpointRequest) bool {
+	rec, err := unmarshalSandboxRecord(manifest)
+	if err != nil {
+		slog.WarnContext(ctx, "Snapshot manifest at this checkpoint's destination cannot be parsed; treating the checkpoint as not committed",
+			slog.String("actor_uid", req.GetActorUid()), slog.Any("err", err))
+		return false
+	}
+	if want := ateattr.SnapshotScopeValue(req.GetScope()); rec.Scope != want {
+		slog.WarnContext(ctx, "Snapshot at this checkpoint's destination records a different scope; not treating it as this checkpoint's result",
+			slog.String("actor_uid", req.GetActorUid()), slog.String("manifest_scope", rec.Scope), slog.String("requested_scope", want))
+		return false
+	}
+	return true
+}
+
 // snapshotManifestUploaded reports whether the snapshot at uri has its
-// manifest in object storage. A missing manifest is an answer, not a failure;
+// manifest in object storage.
+func (s *AteomHerder) snapshotManifestUploaded(ctx context.Context, uri resources.SnapshotURI) (bool, error) {
+	_, uploaded, err := s.fetchUploadedSnapshotManifest(ctx, uri)
+	return uploaded, err
+}
+
+// fetchUploadedSnapshotManifest returns the snapshot manifest at uri, and
+// whether it is there at all. A missing manifest is an answer, not a failure;
 // any other error is one, and is returned rather than read as "not there" —
 // treating an unreachable bucket as "not committed" would re-run a destructive
 // checkpoint on the strength of a failed lookup.
-func (s *AteomHerder) snapshotManifestUploaded(ctx context.Context, uri resources.SnapshotURI) (bool, error) {
+func (s *AteomHerder) fetchUploadedSnapshotManifest(ctx context.Context, uri resources.SnapshotURI) ([]byte, bool, error) {
 	manifestURI, err := uri.ObjectURI(sandboxManifestName)
 	if err != nil {
-		return false, ateerrors.CrashIfReason(ctx, fmt.Errorf("while addressing snapshot manifest in GCS: %w", err), ateerrors.ReasonInvalidObjectURL)
+		return nil, false, ateerrors.CrashIfReason(ctx, fmt.Errorf("while addressing snapshot manifest in GCS: %w", err), ateerrors.ReasonInvalidObjectURL)
 	}
-	if _, err := ategcs.FetchFromGCS(ctx, s.gcsClient, manifestURI); err != nil {
+	manifest, err := ategcs.FetchFromGCS(ctx, s.gcsClient, manifestURI)
+	if err != nil {
 		if errors.Is(err, ateerrors.ReasonFailedGetExternalObject) {
-			return false, nil
+			return nil, false, nil
 		}
-		return false, fmt.Errorf("while probing for an already-uploaded snapshot manifest: %w", err)
+		return nil, false, fmt.Errorf("while probing for an already-uploaded snapshot manifest: %w", err)
 	}
-	return true, nil
+	return manifest, true, nil
 }
 
 func (s *AteomHerder) moveLocalCheckpoint(ctx context.Context, req *ateletpb.CheckpointRequest, checkpointDir string, rec *sandboxAssetsRecord) error {
